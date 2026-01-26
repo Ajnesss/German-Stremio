@@ -4,33 +4,19 @@ const cheerio = require('cheerio');
 const express = require('express');
 
 const BASE_URL = 'https://s.to';
+const RD_API_KEY = process.env.RD_API_KEY || '';
 
-// Manifest with configuration
-function getManifest(config = {}) {
-    return {
-        id: 'org.stremio.germandub',
-        version: '1.0.0',
-        name: 'German Dub (s.to)',
-        description: 'German dubbed streams from s.to with Real-Debrid integration',
-        logo: 'https://i.imgur.com/qlfXn6E.png',
-        resources: ['stream'],
-        types: ['movie', 'series'],
-        idPrefixes: ['tt'],
-        catalogs: [],
-        behaviorHints: {
-            configurable: true,
-            configurationRequired: true
-        },
-        config: [
-            {
-                key: 'rdApiKey',
-                title: 'Real-Debrid API Key',
-                type: 'text',
-                required: true
-            }
-        ]
-    };
-}
+const manifest = {
+    id: 'org.stremio.germandub',
+    version: '1.0.0',
+    name: 'German Dub (s.to)',
+    description: 'German dubbed streams from s.to with Real-Debrid integration',
+    logo: 'https://i.imgur.com/qlfXn6E.png',
+    resources: ['stream'],
+    types: ['movie', 'series'],
+    idPrefixes: ['tt'],
+    catalogs: []
+};
 
 // Helper: Search s.to for a title
 async function searchSto(query, type) {
@@ -210,7 +196,7 @@ async function resolveRedirect(redirectUrl) {
 }
 
 // Helper: Unrestrict link via Real-Debrid
-async function unrestrictWithRD(link, apiKey) {
+async function unrestrictWithRD(link) {
     try {
         console.log(`Unrestricting with RD: ${link}`);
         
@@ -219,7 +205,7 @@ async function unrestrictWithRD(link, apiKey) {
             `link=${encodeURIComponent(link)}`,
             {
                 headers: {
-                    'Authorization': `Bearer ${apiKey}`,
+                    'Authorization': `Bearer ${RD_API_KEY}`,
                     'Content-Type': 'application/x-www-form-urlencoded'
                 },
                 timeout: 15000
@@ -285,107 +271,102 @@ function formatFileSize(bytes) {
     return (bytes / Math.pow(1024, i)).toFixed(2) + ' ' + sizes[i];
 }
 
-// Create builder with config support
-function createAddon(config) {
-    const builder = new addonBuilder(getManifest(config));
+// Create the addon builder
+const builder = new addonBuilder(manifest);
+
+builder.defineStreamHandler(async ({ type, id }) => {
+    console.log(`\n========================================`);
+    console.log(`Stream request: type=${type}, id=${id}`);
+    console.log(`========================================`);
     
-    builder.defineStreamHandler(async ({ type, id }) => {
-        console.log(`\n========================================`);
-        console.log(`Stream request: type=${type}, id=${id}`);
-        console.log(`========================================`);
+    if (!RD_API_KEY) {
+        console.log('No Real-Debrid API key configured');
+        return { streams: [] };
+    }
+    
+    const streams = [];
+    
+    try {
+        const parts = id.split(':');
+        const imdbId = parts[0];
+        const season = parts.length > 1 ? parseInt(parts[1]) : null;
+        const episode = parts.length > 2 ? parseInt(parts[2]) : null;
         
-        const rdApiKey = config.rdApiKey;
+        const metaInfo = await getMetaInfo(imdbId);
         
-        if (!rdApiKey || rdApiKey === 'YOUR_REAL_DEBRID_API_KEY') {
-            console.log('No Real-Debrid API key configured');
+        if (!metaInfo) {
+            console.log('Could not get meta info for:', imdbId);
             return { streams: [] };
         }
         
-        const streams = [];
+        console.log(`Looking for: ${metaInfo.title} (${metaInfo.year})`);
         
-        try {
-            const parts = id.split(':');
-            const imdbId = parts[0];
-            const season = parts.length > 1 ? parseInt(parts[1]) : null;
-            const episode = parts.length > 2 ? parseInt(parts[2]) : null;
-            
-            const metaInfo = await getMetaInfo(imdbId);
-            
-            if (!metaInfo) {
-                console.log('Could not get meta info for:', imdbId);
-                return { streams: [] };
-            }
-            
-            console.log(`Looking for: ${metaInfo.title} (${metaInfo.year})`);
-            
-            const searchResults = await searchSto(metaInfo.title, type);
-            
-            if (searchResults.length === 0) {
-                console.log('No results found on s.to');
-                return { streams: [] };
-            }
-            
-            console.log(`Found ${searchResults.length} results on s.to`);
-            
-            const bestMatch = searchResults[0];
-            console.log(`Using: ${bestMatch.title} - ${bestMatch.url}`);
-            
-            const hosters = await getHosters(bestMatch.url, season, episode);
-            
-            console.log(`Found ${hosters.length} hosters`);
-            
-            for (const hoster of hosters) {
-                try {
-                    const actualUrl = await resolveRedirect(hoster.redirectUrl);
-                    
-                    if (!actualUrl) {
-                        console.log(`Could not resolve: ${hoster.name}`);
-                        continue;
-                    }
-                    
-                    console.log(`Resolved ${hoster.name}: ${actualUrl}`);
-                    
-                    const rdResult = await unrestrictWithRD(actualUrl, rdApiKey);
-                    
-                    if (rdResult) {
-                        const streamTitle = rdResult.filesize 
-                            ? `🇩🇪 ${hoster.name} (RD)\n${formatFileSize(rdResult.filesize)}`
-                            : `🇩🇪 ${hoster.name} (RD)`;
-                        
-                        streams.push({
-                            name: 'German Dub',
-                            title: streamTitle,
-                            url: rdResult.url,
-                            behaviorHints: {
-                                bingeGroup: `germandub-${imdbId}`,
-                                notWebReady: false
-                            }
-                        });
-                        console.log(`✓ Added stream from ${hoster.name}`);
-                    } else {
-                        console.log(`✗ RD could not unrestrict: ${hoster.name}`);
-                    }
-                } catch (error) {
-                    console.error(`Error processing ${hoster.name}:`, error.message);
-                }
-            }
-            
-        } catch (error) {
-            console.error('Stream handler error:', error);
+        const searchResults = await searchSto(metaInfo.title, type);
+        
+        if (searchResults.length === 0) {
+            console.log('No results found on s.to');
+            return { streams: [] };
         }
         
-        console.log(`Returning ${streams.length} streams`);
-        return { streams };
-    });
+        console.log(`Found ${searchResults.length} results on s.to`);
+        
+        const bestMatch = searchResults[0];
+        console.log(`Using: ${bestMatch.title} - ${bestMatch.url}`);
+        
+        const hosters = await getHosters(bestMatch.url, season, episode);
+        
+        console.log(`Found ${hosters.length} hosters`);
+        
+        for (const hoster of hosters) {
+            try {
+                const actualUrl = await resolveRedirect(hoster.redirectUrl);
+                
+                if (!actualUrl) {
+                    console.log(`Could not resolve: ${hoster.name}`);
+                    continue;
+                }
+                
+                console.log(`Resolved ${hoster.name}: ${actualUrl}`);
+                
+                const rdResult = await unrestrictWithRD(actualUrl);
+                
+                if (rdResult) {
+                    const streamTitle = rdResult.filesize 
+                        ? `🇩🇪 ${hoster.name} (RD)\n${formatFileSize(rdResult.filesize)}`
+                        : `🇩🇪 ${hoster.name} (RD)`;
+                    
+                    streams.push({
+                        name: 'German Dub',
+                        title: streamTitle,
+                        url: rdResult.url,
+                        behaviorHints: {
+                            bingeGroup: `germandub-${imdbId}`,
+                            notWebReady: false
+                        }
+                    });
+                    console.log(`✓ Added stream from ${hoster.name}`);
+                } else {
+                    console.log(`✗ RD could not unrestrict: ${hoster.name}`);
+                }
+            } catch (error) {
+                console.error(`Error processing ${hoster.name}:`, error.message);
+            }
+        }
+        
+    } catch (error) {
+        console.error('Stream handler error:', error);
+    }
     
-    return builder;
-}
+    console.log(`Returning ${streams.length} streams`);
+    return { streams };
+});
 
-// Express server with configuration support
+// Express server
 const app = express();
 
 // Landing page
 app.get('/', (req, res) => {
+    const configured = RD_API_KEY ? 'Yes ✓' : 'No ✗';
     res.send(`
         <!DOCTYPE html>
         <html>
@@ -408,27 +389,20 @@ app.get('/', (req, res) => {
                     border-radius: 10px;
                     margin: 20px 0;
                 }
-                input {
-                    width: 100%;
-                    padding: 12px;
+                .status { 
+                    padding: 10px; 
+                    border-radius: 5px; 
                     margin: 10px 0;
-                    border: none;
-                    border-radius: 5px;
-                    font-size: 16px;
-                    box-sizing: border-box;
+                    background: ${RD_API_KEY ? 'rgba(0,255,0,0.2)' : 'rgba(255,0,0,0.2)'};
                 }
-                button {
-                    background: #e50914;
-                    color: white;
-                    border: none;
-                    padding: 15px 30px;
+                code {
+                    background: rgba(0,0,0,0.3);
+                    padding: 10px;
+                    display: block;
                     border-radius: 5px;
-                    font-size: 16px;
-                    cursor: pointer;
-                    width: 100%;
+                    word-break: break-all;
+                    margin: 10px 0;
                 }
-                button:hover { background: #f40612; }
-                .info { color: #aaa; font-size: 14px; }
                 a { color: #4a9eff; }
             </style>
         </head>
@@ -437,46 +411,43 @@ app.get('/', (req, res) => {
             <p>Stream German dubbed content from s.to via Real-Debrid</p>
             
             <div class="card">
-                <h3>Configure Addon</h3>
-                <p class="info">Enter your Real-Debrid API key to get started.</p>
-                <p class="info">Get your API key from: <a href="https://real-debrid.com/apitoken" target="_blank">real-debrid.com/apitoken</a></p>
-                
-                <input type="text" id="apiKey" placeholder="Real-Debrid API Key">
-                <button onclick="installAddon()">Install Addon</button>
+                <h3>Status</h3>
+                <div class="status">Real-Debrid API Key Configured: ${configured}</div>
             </div>
             
-            <script>
-                function installAddon() {
-                    const apiKey = document.getElementById('apiKey').value.trim();
-                    if (!apiKey) {
-                        alert('Please enter your Real-Debrid API key');
-                        return;
-                    }
-                    const config = encodeURIComponent(JSON.stringify({ rdApiKey: apiKey }));
-                    const manifestUrl = window.location.origin + '/' + config + '/manifest.json';
-                    window.location.href = 'stremio://' + manifestUrl.replace(/^https?:\\/\\//, '');
-                }
-            </script>
+            <div class="card">
+                <h3>Install in Stremio</h3>
+                <p>Copy this URL and add it in Stremio:</p>
+                <code>${req.protocol}://${req.get('host')}/manifest.json</code>
+                <p>Or click: <a href="stremio://${req.get('host')}/manifest.json">Install Addon</a></p>
+            </div>
+            
+            ${!RD_API_KEY ? `
+            <div class="card">
+                <h3>⚠️ Setup Required</h3>
+                <p>Add your Real-Debrid API key as an environment variable:</p>
+                <p><strong>RD_API_KEY</strong> = your_api_key</p>
+                <p>Get your API key from: <a href="https://real-debrid.com/apitoken" target="_blank">real-debrid.com/apitoken</a></p>
+            </div>
+            ` : ''}
         </body>
         </html>
     `);
 });
 
-// Handle configured manifest requests
-app.get('/:config/manifest.json', (req, res) => {
-    try {
-        const config = JSON.parse(decodeURIComponent(req.params.config));
-        res.json(getManifest(config));
-    } catch (e) {
-        res.json(getManifest());
-    }
+// Manifest endpoint
+app.get('/manifest.json', (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Content-Type', 'application/json');
+    res.json(manifest);
 });
 
-// Handle stream requests with config
-app.get('/:config/stream/:type/:id.json', async (req, res) => {
+// Stream endpoint
+app.get('/stream/:type/:id.json', async (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Content-Type', 'application/json');
+    
     try {
-        const config = JSON.parse(decodeURIComponent(req.params.config));
-        const builder = createAddon(config);
         const result = await builder.getInterface().stream.handler({
             type: req.params.type,
             id: req.params.id.replace('.json', '')
@@ -488,11 +459,6 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
     }
 });
 
-// Fallback routes for unconfigured addon
-app.get('/manifest.json', (req, res) => {
-    res.json(getManifest());
-});
-
 const PORT = process.env.PORT || 7000;
 
 app.listen(PORT, () => {
@@ -500,12 +466,8 @@ app.listen(PORT, () => {
 ╔════════════════════════════════════════════════════════════╗
 ║           German Dub Stremio Addon (s.to)                  ║
 ╠════════════════════════════════════════════════════════════╣
-║  Configuration Page: http://localhost:${PORT}                 ║
-║                                                            ║
-║  To install:                                               ║
-║  1. Open http://localhost:${PORT} in your browser             ║
-║  2. Enter your Real-Debrid API key                         ║
-║  3. Click "Install Addon"                                  ║
+║  Addon URL: http://localhost:${PORT}/manifest.json            ║
+║  RD API Key: ${RD_API_KEY ? 'Configured ✓' : 'NOT SET ✗'}                              
 ╚════════════════════════════════════════════════════════════╝
     `);
 });
