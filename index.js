@@ -7,7 +7,7 @@ const RD_API_KEY = process.env.RD_API_KEY || '';
 
 const manifest = {
     id: 'org.stremio.germandub',
-    version: '1.0.0',
+    version: '1.0.2',
     name: 'German Dub (s.to)',
     description: 'German dubbed streams from s.to with Real-Debrid integration',
     logo: 'https://i.imgur.com/qlfXn6E.png',
@@ -17,16 +17,17 @@ const manifest = {
     catalogs: []
 };
 
-// Helper: Search s.to for a title
+// Helper: Search s.to for a title - NOW PROPERLY PARSING JSON
 async function searchSto(query, type) {
     try {
+        console.log(`Searching s.to for: "${query}"`);
         const searchUrl = `${BASE_URL}/ajax/search`;
         const response = await axios.post(searchUrl, `keyword=${encodeURIComponent(query)}`, {
             headers: {
                 'Content-Type': 'application/x-www-form-urlencoded',
                 'X-Requested-With': 'XMLHttpRequest',
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': '*/*',
+                'Accept': 'application/json, text/javascript, */*; q=0.01',
                 'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8',
                 'Origin': BASE_URL,
                 'Referer': `${BASE_URL}/`
@@ -34,30 +35,112 @@ async function searchSto(query, type) {
             timeout: 10000
         });
         
-        const $ = cheerio.load(response.data);
-        const results = [];
+        console.log(`Search response type: ${typeof response.data}`);
         
-        $('a').each((i, el) => {
-            const link = $(el).attr('href');
-            const title = $(el).text().trim();
-            if (link && title) {
-                const isMovie = link.includes('/filme/');
-                const isSeries = link.includes('/serie/');
-                
-                if ((type === 'movie' && isMovie) || (type === 'series' && isSeries)) {
-                    results.push({
-                        title,
-                        url: link.startsWith('http') ? link : BASE_URL + link
+        let results = [];
+        let data = response.data;
+        
+        // Parse JSON if it's a string
+        if (typeof data === 'string') {
+            try {
+                data = JSON.parse(data);
+            } catch (e) {
+                console.log('Response is not JSON, trying HTML parse');
+                // Fall back to HTML parsing
+                const $ = cheerio.load(data);
+                $('a').each((i, el) => {
+                    const link = $(el).attr('href');
+                    const title = $(el).text().trim();
+                    if (link && title) {
+                        results.push({ title, link });
+                    }
+                });
+                return results.map(r => ({
+                    title: r.title,
+                    url: r.link.startsWith('http') ? r.link : BASE_URL + r.link
+                }));
+            }
+        }
+        
+        // Handle JSON array response
+        if (Array.isArray(data)) {
+            console.log(`Got ${data.length} results from JSON`);
+            
+            for (const item of data) {
+                if (item.link) {
+                    // Clean up HTML entities and tags from title
+                    let title = item.title || '';
+                    title = title.replace(/<\/?em>/g, '').replace(/\\u[\dA-Fa-f]{4}/g, (match) => {
+                        return String.fromCharCode(parseInt(match.replace('\\u', ''), 16));
                     });
+                    
+                    // Fix escaped slashes in link
+                    let link = item.link.replace(/\\\//g, '/');
+                    
+                    // Check if it's a movie or series based on the link
+                    const isMovie = link.includes('/filme/');
+                    const isSeries = link.includes('/serie/');
+                    
+                    if ((type === 'movie' && isMovie) || (type === 'series' && isSeries)) {
+                        // Extract just the series/movie base URL (without episode info)
+                        let baseUrl = link;
+                        
+                        // For series, get the base series URL
+                        if (isSeries) {
+                            // Link format: /serie/stream/show-name or /serie/stream/show-name/staffel-X/episode-Y
+                            const match = link.match(/^(\/serie\/stream\/[^\/]+)/);
+                            if (match) {
+                                baseUrl = match[1];
+                            }
+                        }
+                        
+                        results.push({
+                            title: title,
+                            url: BASE_URL + baseUrl
+                        });
+                        console.log(`Found: ${title} -> ${BASE_URL + baseUrl}`);
+                    }
                 }
             }
-        });
+            
+            // Remove duplicates based on URL
+            const seen = new Set();
+            results = results.filter(r => {
+                if (seen.has(r.url)) return false;
+                seen.add(r.url);
+                return true;
+            });
+        }
         
         return results;
     } catch (error) {
         console.error('Search error:', error.message);
         return [];
     }
+}
+
+// Helper: Try multiple search variations
+async function searchWithVariations(title, year, type) {
+    const variations = [
+        title,
+        title.split(':')[0].trim(),
+        title.split('-')[0].trim(),
+        title.replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim(),
+    ];
+    
+    const uniqueVariations = [...new Set(variations.filter(v => v.length >= 2))];
+    
+    console.log(`Trying ${uniqueVariations.length} search variations: ${uniqueVariations.join(', ')}`);
+    
+    for (const query of uniqueVariations) {
+        const results = await searchSto(query, type);
+        if (results.length > 0) {
+            console.log(`Found results with query: "${query}"`);
+            return results;
+        }
+    }
+    
+    return [];
 }
 
 // Helper: Get available hosters for an episode/movie
@@ -83,58 +166,37 @@ async function getHosters(pageUrl, season = null, episode = null) {
         const $ = cheerio.load(response.data);
         const hosters = [];
         
-        // s.to uses language keys: 1 = German, 2 = English, 3 = German Sub
-        $('.hosterSiteVideo .generateInlinePlayer').each((i, el) => {
+        console.log(`Page loaded, HTML length: ${response.data.length}`);
+        
+        // Method 1: Look for hoster site video elements with data-link-id
+        $('[data-link-id]').each((i, el) => {
             const $el = $(el);
             const langKey = $el.attr('data-lang-key');
             
-            if (langKey === '1' || langKey === '3') {
+            // Language keys: 1 = German Dub, 2 = English, 3 = German Sub
+            // Accept German dub (1), German sub (3), or no language specified
+            if (langKey === '1' || langKey === '3' || langKey === undefined) {
                 const linkId = $el.attr('data-link-id');
-                const hosterName = $el.find('h4').text().trim() || $el.find('.name').text().trim() || 'Unknown';
                 
-                if (linkId) {
+                // Try to get hoster name from various places
+                let hosterName = $el.find('h4').text().trim() || 
+                                 $el.find('.name').text().trim() ||
+                                 $el.attr('title') ||
+                                 $el.closest('li').find('h4').text().trim() ||
+                                 'Unknown';
+                
+                if (linkId && !hosters.find(h => h.redirectUrl.includes(linkId))) {
                     hosters.push({
-                        name: hosterName,
+                        name: hosterName.substring(0, 30),
                         redirectUrl: `${BASE_URL}/redirect/${linkId}`,
-                        language: langKey === '1' ? 'German Dub' : 'German Sub'
+                        language: langKey === '1' ? 'DE Dub' : langKey === '3' ? 'DE Sub' : 'DE'
                     });
+                    console.log(`Found hoster: ${hosterName} (lang: ${langKey})`);
                 }
             }
         });
         
-        if (hosters.length === 0) {
-            $('a[data-link-id]').each((i, el) => {
-                const $el = $(el);
-                const langKey = $el.attr('data-lang-key');
-                
-                if (langKey === '1' || langKey === '3') {
-                    const linkId = $el.attr('data-link-id');
-                    const hosterName = $el.find('h4').text().trim() || $el.text().trim() || 'Unknown';
-                    
-                    if (linkId) {
-                        hosters.push({
-                            name: hosterName,
-                            redirectUrl: `${BASE_URL}/redirect/${linkId}`,
-                            language: langKey === '1' ? 'German Dub' : 'German Sub'
-                        });
-                    }
-                }
-            });
-        }
-        
-        if (hosters.length === 0) {
-            $('a[href*="/redirect/"]').each((i, el) => {
-                const href = $(el).attr('href');
-                const hosterName = $(el).text().trim() || 'Unknown';
-                
-                hosters.push({
-                    name: hosterName,
-                    redirectUrl: href.startsWith('http') ? href : BASE_URL + href,
-                    language: 'German'
-                });
-            });
-        }
-        
+        console.log(`Total hosters found: ${hosters.length}`);
         return hosters;
     } catch (error) {
         console.error('Get hosters error:', error.message);
@@ -157,9 +219,11 @@ async function resolveRedirect(redirectUrl) {
             timeout: 15000
         });
         
+        // Check final URL after redirects
         if (response.request && response.request.res && response.request.res.responseUrl) {
             const finalUrl = response.request.res.responseUrl;
             if (finalUrl !== redirectUrl && !finalUrl.includes('s.to')) {
+                console.log(`Redirected to: ${finalUrl}`);
                 return finalUrl;
             }
         }
@@ -167,6 +231,7 @@ async function resolveRedirect(redirectUrl) {
         const $ = cheerio.load(response.data);
         const scriptContent = $('script').text();
         
+        // Try various redirect patterns
         let urlMatch = scriptContent.match(/location\.href\s*=\s*["']([^"']+)["']/);
         if (urlMatch) return urlMatch[1];
         
@@ -243,18 +308,6 @@ async function getMetaInfo(imdbId) {
             };
         }
         
-        const cinemetaResp = await axios.get(`https://v3-cinemeta.strem.io/meta/movie/${imdbId}.json`, {
-            timeout: 10000
-        });
-        
-        if (cinemetaResp.data && cinemetaResp.data.meta) {
-            return {
-                title: cinemetaResp.data.meta.name,
-                year: cinemetaResp.data.meta.year,
-                type: cinemetaResp.data.meta.type
-            };
-        }
-        
         return null;
     } catch (error) {
         console.error('Meta info error:', error.message);
@@ -297,40 +350,46 @@ async function handleStream(type, id) {
         }
         
         console.log(`Looking for: ${metaInfo.title} (${metaInfo.year})`);
+        if (season && episode) {
+            console.log(`Season ${season}, Episode ${episode}`);
+        }
         
-        const searchResults = await searchSto(metaInfo.title, type);
+        const searchResults = await searchWithVariations(metaInfo.title, metaInfo.year, type);
         
         if (searchResults.length === 0) {
             console.log('No results found on s.to');
             return { streams: [] };
         }
         
-        console.log(`Found ${searchResults.length} results on s.to`);
+        console.log(`Found ${searchResults.length} unique results on s.to`);
         
         const bestMatch = searchResults[0];
-        console.log(`Using: ${bestMatch.title} - ${bestMatch.url}`);
+        console.log(`Using: ${bestMatch.title} -> ${bestMatch.url}`);
         
         const hosters = await getHosters(bestMatch.url, season, episode);
         
-        console.log(`Found ${hosters.length} hosters`);
+        if (hosters.length === 0) {
+            console.log('No hosters found on page');
+            return { streams: [] };
+        }
+        
+        console.log(`Processing ${hosters.length} hosters...`);
         
         for (const hoster of hosters) {
             try {
                 const actualUrl = await resolveRedirect(hoster.redirectUrl);
                 
                 if (!actualUrl) {
-                    console.log(`Could not resolve: ${hoster.name}`);
+                    console.log(`✗ Could not resolve: ${hoster.name}`);
                     continue;
                 }
-                
-                console.log(`Resolved ${hoster.name}: ${actualUrl}`);
                 
                 const rdResult = await unrestrictWithRD(actualUrl);
                 
                 if (rdResult) {
                     const streamTitle = rdResult.filesize 
-                        ? `🇩🇪 ${hoster.name} (RD)\n${formatFileSize(rdResult.filesize)}`
-                        : `🇩🇪 ${hoster.name} (RD)`;
+                        ? `🇩🇪 ${hoster.name}\n${formatFileSize(rdResult.filesize)}`
+                        : `🇩🇪 ${hoster.name}`;
                     
                     streams.push({
                         name: 'German Dub',
@@ -341,12 +400,12 @@ async function handleStream(type, id) {
                             notWebReady: false
                         }
                     });
-                    console.log(`✓ Added stream from ${hoster.name}`);
+                    console.log(`✓ Added stream: ${hoster.name}`);
                 } else {
-                    console.log(`✗ RD could not unrestrict: ${hoster.name}`);
+                    console.log(`✗ RD failed: ${hoster.name}`);
                 }
             } catch (error) {
-                console.error(`Error processing ${hoster.name}:`, error.message);
+                console.error(`✗ Error with ${hoster.name}:`, error.message);
             }
         }
         
@@ -354,7 +413,9 @@ async function handleStream(type, id) {
         console.error('Stream handler error:', error);
     }
     
+    console.log(`========================================`);
     console.log(`Returning ${streams.length} streams`);
+    console.log(`========================================\n`);
     return { streams };
 }
 
@@ -418,15 +479,6 @@ app.get('/', (req, res) => {
                 <code>https://${req.get('host')}/manifest.json</code>
                 <p>Or click: <a href="stremio://${req.get('host')}/manifest.json">Install Addon</a></p>
             </div>
-            
-            ${!RD_API_KEY ? `
-            <div class="card">
-                <h3>⚠️ Setup Required</h3>
-                <p>Add your Real-Debrid API key as an environment variable:</p>
-                <p><strong>RD_API_KEY</strong> = your_api_key</p>
-                <p>Get your API key from: <a href="https://real-debrid.com/apitoken" target="_blank">real-debrid.com/apitoken</a></p>
-            </div>
-            ` : ''}
         </body>
         </html>
     `);
@@ -464,6 +516,7 @@ app.listen(PORT, () => {
 ╔════════════════════════════════════════════════════════════╗
 ║           German Dub Stremio Addon (s.to)                  ║
 ╠════════════════════════════════════════════════════════════╣
+║  Version: 1.0.2                                            ║
 ║  Addon URL: http://localhost:${PORT}/manifest.json            ║
 ║  RD API Key: ${RD_API_KEY ? 'Configured ✓' : 'NOT SET ✗'}                              
 ╚════════════════════════════════════════════════════════════╝
