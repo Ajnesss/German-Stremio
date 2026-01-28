@@ -1,4 +1,3 @@
-const { addonBuilder } = require('stremio-addon-sdk');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const express = require('express');
@@ -271,10 +270,8 @@ function formatFileSize(bytes) {
     return (bytes / Math.pow(1024, i)).toFixed(2) + ' ' + sizes[i];
 }
 
-// Create the addon builder
-const builder = new addonBuilder(manifest);
-
-builder.defineStreamHandler(async ({ type, id }) => {
+// Stream handler function
+async function handleStream(type, id) {
     console.log(`\n========================================`);
     console.log(`Stream request: type=${type}, id=${id}`);
     console.log(`========================================`);
@@ -359,7 +356,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
     
     console.log(`Returning ${streams.length} streams`);
     return { streams };
-});
+}
 
 // Express server
 const app = express();
@@ -418,7 +415,7 @@ app.get('/', (req, res) => {
             <div class="card">
                 <h3>Install in Stremio</h3>
                 <p>Copy this URL and add it in Stremio:</p>
-                <code>${req.protocol}://${req.get('host')}/manifest.json</code>
+                <code>https://${req.get('host')}/manifest.json</code>
                 <p>Or click: <a href="stremio://${req.get('host')}/manifest.json">Install Addon</a></p>
             </div>
             
@@ -438,6 +435,7 @@ app.get('/', (req, res) => {
 // Manifest endpoint
 app.get('/manifest.json', (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Headers', '*');
     res.setHeader('Content-Type', 'application/json');
     res.json(manifest);
 });
@@ -445,13 +443,13 @@ app.get('/manifest.json', (req, res) => {
 // Stream endpoint
 app.get('/stream/:type/:id.json', async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Headers', '*');
     res.setHeader('Content-Type', 'application/json');
     
     try {
-        const result = await builder.getInterface().stream.handler({
-            type: req.params.type,
-            id: req.params.id.replace('.json', '')
-        });
+        const type = req.params.type;
+        const id = req.params.id.replace('.json', '');
+        const result = await handleStream(type, id);
         res.json(result);
     } catch (error) {
         console.error('Stream error:', error);
